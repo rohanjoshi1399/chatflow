@@ -8,10 +8,14 @@ Complete implementation of a distributed chat system.
 ### Import into IntelliJ IDEA
 
 1. Open IntelliJ IDEA
-2. File → Open
-3. Select the `chatflow-assignment1` folder
-4. IntelliJ will auto-detect Maven projects
-5. Wait for dependencies to download
+2. File → New → Project from Version Control
+3. Select Git
+4. Enter `https://github.khoury.northeastern.edu/rohki13/cs6650-assignment1.git`
+5. Select a directory to clone the project into
+6. Click `Next`
+7. Select `Import project from external model` and click `Next`
+8. Select `Maven` and click `Next`
+9. Click `Finish`
 
 ### Build Projects
 ```bash
@@ -22,3 +26,4 @@ mvn clean package
 # Client
 cd client
 mvn clean package
+```
