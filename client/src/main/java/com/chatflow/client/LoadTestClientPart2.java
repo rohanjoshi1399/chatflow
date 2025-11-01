@@ -452,8 +452,4 @@ public class LoadTestClientPart2 {
 
         System.out.println("=".repeat(60));
     }
-
-    // Delegate methods (same as LoadTestClient but with metrics flag)
-    // ... [Include sendMessagesAndTerminate and sendMessagesWithPersistentConnection
-    //      from your LoadTestClient with collectMetrics parameter]
 }

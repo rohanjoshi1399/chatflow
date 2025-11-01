@@ -26,7 +26,6 @@ public class ChatWebSocketClient extends WebSocketClient {
     private String assignedRoomId;
     private boolean trackMetrics = false;
 
-    // Constructor with semaphore (for backpressure control)
     public ChatWebSocketClient(URI serverUri, CountDownLatch responseLatch,
                                AtomicInteger successCount, AtomicInteger errorCount,
                                Semaphore inFlightSemaphore) {
@@ -42,7 +41,6 @@ public class ChatWebSocketClient extends WebSocketClient {
         this.roomId = parts[parts.length - 1];
     }
 
-    // Constructor without semaphore (backward compatibility)
     public ChatWebSocketClient(URI serverUri, CountDownLatch responseLatch,
                                AtomicInteger successCount, AtomicInteger errorCount) {
         this(serverUri, responseLatch, successCount, errorCount, null);
@@ -65,14 +63,22 @@ public class ChatWebSocketClient extends WebSocketClient {
 
         try {
             var response = objectMapper.readTree(message);
-            String status = response.get("status").asText();
 
-            if ("SUCCESS".equals(status)) {
+            // Accept EITHER format: ACK or QueueMessage broadcast
+            boolean isSuccess = false;
+
+            if (response.has("status") && "SUCCESS".equals(response.get("status").asText())) {
+                isSuccess = true;  // It's an ACK
+            } else if (response.has("messageId")) {
+                isSuccess = true;  // It's a QueueMessage broadcast
+            }
+
+            if (isSuccess) {
                 successCount.incrementAndGet();
 
                 if (trackMetrics && metricsCollector != null) {
-                    var original = response.get("originalMessage");
-                    String messageType = original.get("messageType").asText();
+                    String messageType = response.has("messageType") ?
+                            response.get("messageType").asText() : "TEXT";
                     metricsCollector.recordMetric(lastSendTime, receiveTime,
                             messageType, 200, assignedRoomId);
                 }
@@ -89,7 +95,6 @@ public class ChatWebSocketClient extends WebSocketClient {
             errorCount.incrementAndGet();
         } finally {
             responseLatch.countDown();
-
             if (inFlightSemaphore != null) {
                 inFlightSemaphore.release();
             }
