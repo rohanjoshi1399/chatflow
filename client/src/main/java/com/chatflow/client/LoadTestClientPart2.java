@@ -141,9 +141,9 @@ public class LoadTestClientPart2 {
         List<Future<?>> futures = new ArrayList<>();
 
         for (int i = 0; i < OPTIMAL_THREADS; i++) {
-            final int threadMessages = (i == OPTIMAL_THREADS - 1) ?
-                    MAIN_PHASE_MESSAGES - (messagesPerThread * (OPTIMAL_THREADS - 1)) :
-                    messagesPerThread;
+            final int threadMessages = (i == OPTIMAL_THREADS - 1)
+                    ? MAIN_PHASE_MESSAGES - (messagesPerThread * (OPTIMAL_THREADS - 1))
+                    : messagesPerThread;
 
             Future<?> future = executor.submit(() -> {
                 sendMessagesWithPersistentConnection(baseServerUrl, messageQueue,
@@ -169,11 +169,11 @@ public class LoadTestClientPart2 {
     }
 
     private void sendMessagesAndTerminate(String baseServerUrl,
-                                          BlockingQueue<ChatMessage> messageQueue,
-                                          int messageCount,
-                                          AtomicInteger successCount,
-                                          AtomicInteger errorCount,
-                                          boolean collectMetrics) {
+            BlockingQueue<ChatMessage> messageQueue,
+            int messageCount,
+            AtomicInteger successCount,
+            AtomicInteger errorCount,
+            boolean collectMetrics) {
         ChatWebSocketClient client = null;
         String roomId = String.valueOf(random.nextInt(20) + 1);
         Semaphore inFlightSemaphore = new Semaphore(MAX_IN_FLIGHT_PER_CONNECTION);
@@ -222,7 +222,7 @@ public class LoadTestClientPart2 {
                 }
             }
 
-            latch.await(120, TimeUnit.SECONDS);
+            latch.await(300, TimeUnit.SECONDS);
 
         } catch (Exception e) {
             System.err.println("Error: " + e.getMessage());
@@ -239,11 +239,11 @@ public class LoadTestClientPart2 {
     }
 
     private void sendMessagesWithPersistentConnection(String baseServerUrl,
-                                                      BlockingQueue<ChatMessage> messageQueue,
-                                                      int messageCount,
-                                                      AtomicInteger successCount,
-                                                      AtomicInteger errorCount,
-                                                      boolean collectMetrics) {
+            BlockingQueue<ChatMessage> messageQueue,
+            int messageCount,
+            AtomicInteger successCount,
+            AtomicInteger errorCount,
+            boolean collectMetrics) {
         ChatWebSocketClient client = null;
         String roomId = String.valueOf(random.nextInt(20) + 1);
         Semaphore inFlightSemaphore = new Semaphore(MAX_IN_FLIGHT_PER_CONNECTION);
@@ -303,7 +303,7 @@ public class LoadTestClientPart2 {
                 }
             }
 
-            latch.await(180, TimeUnit.SECONDS);
+            latch.await(300, TimeUnit.SECONDS);
 
         } catch (Exception e) {
             log.error("Error: {}", e.getMessage());
@@ -320,8 +320,8 @@ public class LoadTestClientPart2 {
     }
 
     private boolean sendWithRetry(ChatWebSocketClient client, String jsonMessage,
-                                  CountDownLatch latch, AtomicInteger errorCount,
-                                  Semaphore semaphore) {
+            CountDownLatch latch, AtomicInteger errorCount,
+            Semaphore semaphore) {
         for (int retry = 0; retry < MAX_RETRIES; retry++) {
             try {
                 if (!client.isOpen()) {

@@ -40,7 +40,7 @@ cat > target/application.properties <<EOF
 server.port=8080
 server.id=$SERVER_ID
 
-aws.region=us-east-1
+aws.region=us-west-2
 
 sqs.queue.prefix=chatflow-room-
 sqs.fifo.enabled=true

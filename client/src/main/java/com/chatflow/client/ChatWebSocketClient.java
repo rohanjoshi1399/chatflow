@@ -27,8 +27,8 @@ public class ChatWebSocketClient extends WebSocketClient {
     private boolean trackMetrics = false;
 
     public ChatWebSocketClient(URI serverUri, CountDownLatch responseLatch,
-                               AtomicInteger successCount, AtomicInteger errorCount,
-                               Semaphore inFlightSemaphore) {
+            AtomicInteger successCount, AtomicInteger errorCount,
+            Semaphore inFlightSemaphore) {
         super(serverUri);
         this.responseLatch = responseLatch;
         this.successCount = successCount;
@@ -42,7 +42,7 @@ public class ChatWebSocketClient extends WebSocketClient {
     }
 
     public ChatWebSocketClient(URI serverUri, CountDownLatch responseLatch,
-                               AtomicInteger successCount, AtomicInteger errorCount) {
+            AtomicInteger successCount, AtomicInteger errorCount) {
         this(serverUri, responseLatch, successCount, errorCount, null);
     }
 
@@ -64,36 +64,40 @@ public class ChatWebSocketClient extends WebSocketClient {
         try {
             var response = objectMapper.readTree(message);
 
-            // Accept EITHER format: ACK or QueueMessage broadcast
-            boolean isSuccess = false;
-
+            // FIXED: Only count ACKs, ignore broadcasts
+            // ACKs have "status": "SUCCESS"
+            // Broadcasts have "messageId" and "roomId" but no "status"
             if (response.has("status") && "SUCCESS".equals(response.get("status").asText())) {
-                isSuccess = true;  // It's an ACK
-            } else if (response.has("messageId")) {
-                isSuccess = true;  // It's a QueueMessage broadcast
-            }
-
-            if (isSuccess) {
+                // This is an ACK response - count it
                 successCount.incrementAndGet();
 
                 if (trackMetrics && metricsCollector != null) {
-                    String messageType = response.has("messageType") ?
-                            response.get("messageType").asText() : "TEXT";
+                    String messageType = response.has("messageType") ? response.get("messageType").asText() : "ACK";
                     metricsCollector.recordMetric(lastSendTime, receiveTime,
                             messageType, 200, assignedRoomId);
                 }
-            } else {
-                errorCount.incrementAndGet();
 
-                if (trackMetrics && metricsCollector != null) {
-                    metricsCollector.recordMetric(lastSendTime, receiveTime,
-                            "ERROR", 400, assignedRoomId);
+                // Count down latch only for ACKs
+                responseLatch.countDown();
+                if (inFlightSemaphore != null) {
+                    inFlightSemaphore.release();
+                }
+            } else if (response.has("messageId") && response.has("roomId")) {
+                // This is a broadcast message - just logging it, don't count
+                // log.debug("Received broadcast for message: {}",
+                // response.get("messageId").asText());
+                // Don't count down latch or release semaphore for broadcasts
+            } else {
+                // Unknown message format - count as error
+                errorCount.incrementAndGet();
+                responseLatch.countDown();
+                if (inFlightSemaphore != null) {
+                    inFlightSemaphore.release();
                 }
             }
 
         } catch (Exception e) {
             errorCount.incrementAndGet();
-        } finally {
             responseLatch.countDown();
             if (inFlightSemaphore != null) {
                 inFlightSemaphore.release();

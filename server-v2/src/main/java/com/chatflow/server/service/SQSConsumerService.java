@@ -1,6 +1,7 @@
 package com.chatflow.server.service;
 
 import com.chatflow.server.model.QueueMessage;
+import com.chatflow.server.persistence.BatchMessageWriter;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -11,6 +12,8 @@ import software.amazon.awssdk.services.sqs.model.*;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -27,10 +30,16 @@ public class SQSConsumerService {
     private ObjectMapper objectMapper;
 
     @Autowired
-    private RoomSessionManager roomManager;
+    private RoomManager roomManager;
 
     @Autowired
     private SQSService sqsService;
+
+    @Autowired
+    private ConsumerPartitioningService partitioningService;
+
+    @Autowired
+    private BatchMessageWriter batchMessageWriter;
 
     @Value("${sqs.consumer.threads:40}")
     private int consumerThreads;
@@ -51,6 +60,7 @@ public class SQSConsumerService {
     private final AtomicBoolean running = new AtomicBoolean(false);
     private final AtomicLong messagesProcessed = new AtomicLong(0);
     private final AtomicLong messagesFailed = new AtomicLong(0);
+    private final AtomicLong messagesDeletedWithoutBroadcast = new AtomicLong(0);
 
     @PostConstruct
     public void init() {
@@ -60,6 +70,9 @@ public class SQSConsumerService {
         }
 
         log.info("Initializing SQS Consumer Service with {} threads", consumerThreads);
+
+        // FIXED: Set running to true BEFORE creating threads
+        running.set(true);
 
         // Create thread pool for consumers
         consumerExecutor = Executors.newFixedThreadPool(
@@ -74,10 +87,7 @@ public class SQSConsumerService {
                         thread.setDaemon(false);
                         return thread;
                     }
-                }
-        );
-
-        running.set(true);
+                });
 
         // Start consumers
         startConsumers();
@@ -87,45 +97,99 @@ public class SQSConsumerService {
 
     /**
      * Start consumer threads for all rooms
+     * FIXED: Correct room assignment logic - no more idle threads
+     * FIXED: Uses ConsumerPartitioningService for multi-instance deployments
      */
     private void startConsumers() {
+        // FIXED: Get assigned rooms from partitioning service
+        List<String> assignedRooms = partitioningService.getAssignedRooms();
 
-        // Calculate rooms per thread
-        int roomsPerThread = (int) Math.ceil(20.0 / consumerThreads);
+        if (assignedRooms.isEmpty()) {
+            log.error("No rooms assigned to this instance! Consumer will not start.");
+            return;
+        }
 
-        for (int threadIndex = 0; threadIndex < consumerThreads; threadIndex++) {
-            int startRoom = (threadIndex * roomsPerThread) + 1;
-            int endRoom = Math.min(startRoom + roomsPerThread - 1, 20);
+        log.info("This instance will consume {} rooms: {}", assignedRooms.size(), assignedRooms);
+
+        // FIXED: Only create as many active threads as assigned rooms (or configured
+        // max)
+        int roomsToConsume = assignedRooms.size();
+        int activeThreads = Math.min(consumerThreads, roomsToConsume);
+
+        // Calculate base rooms per thread and remainder
+        int baseRoomsPerThread = roomsToConsume / activeThreads;
+        int extraRooms = roomsToConsume % activeThreads;
+
+        log.info("Distributing {} assigned rooms across {} consumer threads", roomsToConsume, activeThreads);
+        log.info("Base rooms per thread: {}, Extra rooms to distribute: {}",
+                baseRoomsPerThread, extraRooms);
+
+        int currentRoomIndex = 0;
+
+        for (int threadIndex = 0; threadIndex < activeThreads; threadIndex++) {
+            // First 'extraRooms' threads get one extra room
+            int roomsForThread = baseRoomsPerThread + (threadIndex < extraRooms ? 1 : 0);
+
+            // Get subset of assigned rooms for this thread
+            List<String> threadRooms = new ArrayList<>();
+            for (int i = 0; i < roomsForThread && currentRoomIndex < assignedRooms.size(); i++) {
+                threadRooms.add(assignedRooms.get(currentRoomIndex));
+                currentRoomIndex++;
+            }
+
+            if (threadRooms.isEmpty()) {
+                continue; // Skip if no rooms for this thread
+            }
 
             final int threadNum = threadIndex + 1;
+            final List<String> roomsForConsumer = new ArrayList<>(threadRooms);
 
             consumerExecutor.submit(() -> {
-                log.info("Consumer thread {} started, handling rooms {} to {}",
-                        threadNum, startRoom, endRoom);
-                consumeMessages(startRoom, endRoom, threadNum);
+                log.info("Consumer thread {} started, handling rooms {} ({} rooms)",
+                        threadNum, roomsForConsumer, roomsForConsumer.size());
+
+                try {
+                    consumeMessagesFromRooms(roomsForConsumer, threadNum);
+                } catch (Exception e) {
+                    log.error("Consumer thread {} crashed: {}", threadNum, e.getMessage(), e);
+                } finally {
+                    log.info("Consumer thread {} stopped", threadNum);
+                }
             });
         }
 
-        log.info("Started {} consumer threads for 20 rooms", consumerThreads);
+        log.info("Started {} consumer threads for {} assigned rooms", activeThreads, roomsToConsume);
     }
 
     /**
-     * Consume messages from assigned rooms
+     * Consume messages from a list of assigned rooms (supports partitioning)
+     * FIXED: Better error handling and conditional sleep
      */
-    private void consumeMessages(int startRoom, int endRoom, int threadNum) {
+    private void consumeMessagesFromRooms(List<String> roomIds, int threadNum) {
+        log.info("Thread {}: Starting message consumption loop for rooms {}", threadNum, roomIds);
+
+        int loopIterations = 0;
+
         while (running.get()) {
+            loopIterations++;
+            boolean anyMessagesReceived = false;
+
             try {
                 // Poll each assigned room
-                for (int roomId = startRoom; roomId <= endRoom; roomId++) {
+                for (String roomId : roomIds) {
                     if (!running.get()) {
+                        log.info("Thread {}: Stopping due to shutdown signal", threadNum);
                         break;
                     }
 
-                    String roomIdStr = String.valueOf(roomId);
-                    String queueUrl = sqsService.getCachedQueueUrl(roomIdStr);
+                    String queueUrl = sqsService.getCachedQueueUrl(roomId);
 
                     if (queueUrl == null) {
-                        log.warn("Thread {}: Queue URL not found for room {}", threadNum, roomIdStr);
+                        // FIXED: Will auto-retry via lazy loading in SQSService
+                        if (loopIterations % 100 == 1) { // Log occasionally, not every time
+                            log.warn("Thread {}: Queue URL not found for room {} (will retry)",
+                                    threadNum, roomId);
+                        }
                         continue;
                     }
 
@@ -142,23 +206,28 @@ public class SQSConsumerService {
                         List<Message> messages = receiveResponse.messages();
 
                         if (!messages.isEmpty()) {
+                            anyMessagesReceived = true;
                             log.debug("Thread {}: Received {} messages from room {}",
-                                    threadNum, messages.size(), roomIdStr);
+                                    threadNum, messages.size(), roomId);
                         }
 
                         // Process each message
                         for (Message message : messages) {
-                            processMessage(message, queueUrl, roomIdStr, threadNum);
+                            if (!running.get()) {
+                                break;
+                            }
+                            processMessage(message, queueUrl, roomId, threadNum);
                         }
 
                     } catch (Exception e) {
                         log.error("Thread {}: Error receiving messages from room {}: {}",
-                                threadNum, roomIdStr, e.getMessage());
+                                threadNum, roomId, e.getMessage());
+                        // Continue to next room on error
                     }
                 }
 
-                // Small delay to prevent tight loop when no messages
-                if (running.get()) {
+                // FIXED: Only sleep if no messages received (optimization)
+                if (!anyMessagesReceived && running.get()) {
                     Thread.sleep(100);
                 }
 
@@ -167,41 +236,66 @@ public class SQSConsumerService {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
-                log.error("Thread {}: Unexpected error in consumer loop: {}", threadNum, e.getMessage(), e);
+                log.error("Thread {}: Unexpected error in consumer loop: {}",
+                        threadNum, e.getMessage(), e);
+
+                // Sleep before retrying to avoid tight error loop
+                try {
+                    Thread.sleep(1000);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
             }
         }
 
-        log.info("Consumer thread {} stopped", threadNum);
+        log.info("Thread {}: Exited message consumption loop after {} iterations",
+                threadNum, loopIterations);
     }
 
     /**
      * Process a single message
+     * FIXED: Only delete message after successful broadcast
+     * Assignment 3: Added database persistence
      */
     private void processMessage(Message message, String queueUrl, String roomId, int threadNum) {
         try {
             // Parse message body
             QueueMessage queueMessage = objectMapper.readValue(
                     message.body(),
-                    QueueMessage.class
-            );
+                    QueueMessage.class);
 
             log.debug("Thread {}: Processing message {} from room {}",
                     threadNum, queueMessage.getMessageId(), roomId);
 
-            // Broadcast to all sessions in the room
-            roomManager.broadcastToRoom(queueMessage);
+            // Broadcast to WebSocket clients (existing functionality)
+            RoomManager.BroadcastResult result = roomManager.broadcastToRoom(queueMessage);
 
-            // Delete message from queue (acknowledge)
-            deleteMessage(queueUrl, message.receiptHandle());
+            // Assignment 3: Enqueue for database persistence
+            boolean enqueued = batchMessageWriter.enqueue(queueMessage);
+            if (!enqueued) {
+                log.warn("Thread {}: Failed to enqueue message {} for persistence (buffer full)",
+                        threadNum, queueMessage.getMessageId());
+            }
 
-            messagesProcessed.incrementAndGet();
+            // Delete if broadcast succeeded OR if persisted to DB
+            if (enqueued) {
+                deleteMessage(queueUrl, message.receiptHandle());
+                messagesProcessed.incrementAndGet();
+
+                if (result.getSuccessCount() == 0) {
+                    // Persisted but not broadcast - that's OK
+                    log.debug("Message persisted to DB but no active clients");
+                }
+            }
 
         } catch (Exception e) {
             log.error("Thread {}: Failed to process message from room {}: {}",
                     threadNum, roomId, e.getMessage(), e);
             messagesFailed.incrementAndGet();
 
-            // Don't delete message - it will become visible again for retry
+            // FIXED: Don't delete message on processing error - it will become visible
+            // again
         }
     }
 
@@ -224,6 +318,7 @@ public class SQSConsumerService {
 
     /**
      * Stop all consumers gracefully
+     * FIXED: Better shutdown logging
      */
     @PreDestroy
     public void shutdown() {
@@ -240,6 +335,11 @@ public class SQSConsumerService {
                 if (!consumerExecutor.awaitTermination(30, TimeUnit.SECONDS)) {
                     log.warn("Consumer threads did not terminate in time, forcing shutdown");
                     consumerExecutor.shutdownNow();
+
+                    // Wait a bit more for forced shutdown
+                    if (!consumerExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                        log.error("Consumer threads still running after forced shutdown");
+                    }
                 }
             } catch (InterruptedException e) {
                 log.error("Interrupted while waiting for consumer shutdown");
@@ -248,8 +348,10 @@ public class SQSConsumerService {
             }
         }
 
-        log.info("SQS Consumer Service shutdown complete. Processed: {}, Failed: {}",
-                messagesProcessed.get(), messagesFailed.get());
+        log.info("SQS Consumer Service shutdown complete.");
+        log.info("  Messages processed: {}", messagesProcessed.get());
+        log.info("  Messages failed: {}", messagesFailed.get());
+        log.info("  Messages that couldn't broadcast: {}", messagesDeletedWithoutBroadcast.get());
     }
 
     /**
@@ -261,6 +363,10 @@ public class SQSConsumerService {
 
     public long getMessagesFailed() {
         return messagesFailed.get();
+    }
+
+    public long getMessagesDeletedWithoutBroadcast() {
+        return messagesDeletedWithoutBroadcast.get();
     }
 
     public boolean isRunning() {

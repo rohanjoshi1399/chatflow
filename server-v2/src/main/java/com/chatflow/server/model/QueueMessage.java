@@ -16,34 +16,34 @@ import java.util.UUID;
 public class QueueMessage {
 
     @JsonProperty("messageId")
-    private String messageId;  // messageId
+    private String messageId;
 
     @JsonProperty("roomId")
-    private String roomId;  // roomId
-    
+    private String roomId;
+
     @JsonProperty("userId")
-    private String userId;  // userId
+    private String userId;
 
     @JsonProperty("username")
-    private String username;  // username
+    private String username;
 
     @JsonProperty("message")
-    private String message;  // message
+    private String message;
 
     @JsonProperty("timestamp")
-    private String timestamp;  // ISO-8601 format
+    private String timestamp; // ISO-8601 format
 
     @JsonProperty("messageType")
     private ChatMessage.MessageType messageType;
 
     @JsonProperty("serverId")
-    private String serverId;  // serverId
+    private String serverId;
 
     @JsonProperty("clientIp")
-    private String clientIp;  // clientIp
+    private String clientIp;
 
     public QueueMessage(String roomId, String userId, String username,
-                        String message, ChatMessage.MessageType messageType, String serverId, String clientIp) {
+            String message, ChatMessage.MessageType messageType, String serverId, String clientIp) {
         this.messageId = UUID.randomUUID().toString();
         this.roomId = roomId;
         this.userId = userId;
@@ -53,5 +53,20 @@ public class QueueMessage {
         this.messageType = messageType;
         this.serverId = serverId;
         this.clientIp = clientIp;
+    }
+
+    /**
+     * Get timestamp as Instant for database persistence
+     * Parses the ISO-8601 string timestamp
+     */
+    public Instant getTimestampAsInstant() {
+        if (timestamp == null || timestamp.isEmpty()) {
+            return Instant.now();
+        }
+        try {
+            return Instant.parse(timestamp);
+        } catch (Exception e) {
+            return Instant.now();
+        }
     }
 }

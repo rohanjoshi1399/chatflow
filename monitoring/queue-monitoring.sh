@@ -3,7 +3,7 @@
 # ChatFlow Queue Monitoring Script
 # Continuously monitors all 20 SQS queues and displays their depths
 
-REGION="us-east-1"
+REGION="us-west-2"
 QUEUE_PREFIX="chatflow-room-"
 REFRESH_INTERVAL=5  # seconds
 

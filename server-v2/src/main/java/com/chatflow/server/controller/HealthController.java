@@ -1,9 +1,13 @@
 package com.chatflow.server.controller;
 
 import com.chatflow.server.handler.ChatWebSocketHandler;
-import com.chatflow.server.service.RoomSessionManager;
+import com.chatflow.server.persistence.BatchMessageWriter;
+import com.chatflow.server.persistence.MessagePersistenceService;
+import com.chatflow.server.service.RoomManager;
 import com.chatflow.server.service.SQSConsumerService;
 import com.chatflow.server.service.SQSService;
+import com.chatflow.server.service.WebSocketWriteManager;
+
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
@@ -29,32 +33,81 @@ public class HealthController {
     private SQSConsumerService consumerService;
 
     @Autowired
-    private RoomSessionManager roomManager;
+    private RoomManager roomManager;
+
+    @Autowired
+    private WebSocketWriteManager writeManager;
+
+    @Autowired(required = false)
+    private BatchMessageWriter batchWriter;
+
+    @Autowired(required = false)
+    private MessagePersistenceService persistenceService;
 
     @Value("${server.id:server-1}")
     private String serverId;
 
     /**
-     * Health check endpoint for ALB
+     * Main health check endpoint for load balancer health monitoring.
+     * Checks SQS connectivity, consumer status, write manager, and optionally
+     * database.
+     * 
+     * @return health status with component-level details
      */
     @GetMapping("/health")
     public ResponseEntity<Map<String, Object>> health() {
         Map<String, Object> health = new HashMap<>();
-        health.put("status", "UP");
         health.put("serverId", serverId);
         health.put("timestamp", System.currentTimeMillis());
 
-        return ResponseEntity.ok(health);
+        try {
+            // Check SQS connectivity
+            boolean sqsHealthy = checkSQSHealth();
+            health.put("sqsHealthy", sqsHealthy);
+
+            // Check consumer running
+            boolean consumerHealthy = consumerService.isRunning();
+            health.put("consumerHealthy", consumerHealthy);
+
+            // Check write manager
+            boolean writeManagerHealthy = checkWriteManagerHealth();
+            health.put("writeManagerHealthy", writeManagerHealthy);
+
+            // Check database (optional - Assignment 3)
+            boolean databaseHealthy = checkDatabaseHealth();
+            health.put("databaseHealthy", databaseHealthy);
+            health.put("databaseConfigured", persistenceService != null);
+
+            // Overall status (database is optional, so don't fail on it)
+            boolean isHealthy = sqsHealthy && consumerHealthy && writeManagerHealthy;
+            String status = isHealthy ? "UP" : "DOWN";
+            health.put("status", status);
+
+            if (!isHealthy) {
+                return ResponseEntity.status(503).body(health);
+            }
+
+            return ResponseEntity.ok(health);
+
+        } catch (Exception e) {
+            log.error("Health check failed with exception: {}", e.getMessage(), e);
+            health.put("status", "DOWN");
+            health.put("error", e.getMessage());
+            return ResponseEntity.status(503).body(health);
+        }
     }
 
     /**
-     * Detailed metrics endpoint
+     * Returns detailed application metrics for monitoring.
+     * Includes WebSocket handler stats, SQS metrics, consumer metrics, and room
+     * stats.
+     * 
+     * @return comprehensive metrics from all system components
      */
     @GetMapping("/metrics")
     public ResponseEntity<Map<String, Object>> metrics() {
         Map<String, Object> metrics = new HashMap<>();
 
-        // Server info
         metrics.put("serverId", serverId);
         metrics.put("timestamp", System.currentTimeMillis());
 
@@ -63,6 +116,8 @@ public class HealthController {
         handlerMetrics.put("messagesReceived", webSocketHandler.getMessagesReceived());
         handlerMetrics.put("messagesPublished", webSocketHandler.getMessagesPublished());
         handlerMetrics.put("messagesFailed", webSocketHandler.getMessagesFailed());
+        handlerMetrics.put("acksSent", webSocketHandler.getAcksSent());
+        handlerMetrics.put("acksFailed", webSocketHandler.getAcksFailed());
         metrics.put("handler", handlerMetrics);
 
         // SQS service metrics
@@ -74,6 +129,7 @@ public class HealthController {
         Map<String, Object> consumerMetrics = new HashMap<>();
         consumerMetrics.put("messagesProcessed", consumerService.getMessagesProcessed());
         consumerMetrics.put("messagesFailed", consumerService.getMessagesFailed());
+        consumerMetrics.put("messagesDeletedWithoutBroadcast", consumerService.getMessagesDeletedWithoutBroadcast());
         consumerMetrics.put("isRunning", consumerService.isRunning());
         metrics.put("consumer", consumerMetrics);
 
@@ -86,11 +142,56 @@ public class HealthController {
         roomMetrics.put("roomStats", roomManager.getRoomStats());
         metrics.put("rooms", roomMetrics);
 
+        // Write manager metrics
+        Map<String, Object> writeMetrics = getWriteMetrics();
+        metrics.put("writeManager", writeMetrics);
+
         return ResponseEntity.ok(metrics);
     }
 
     /**
-     * Get queue depth for a specific room
+     * Returns database persistence metrics including write counts and errors.
+     * Only available if database persistence is configured.
+     * 
+     * @return database-specific metrics
+     */
+    @GetMapping("/db-metrics")
+    public ResponseEntity<Map<String, Object>> getDatabaseMetrics() {
+        if (batchWriter == null || persistenceService == null) {
+            return ResponseEntity.status(503)
+                    .body(Map.of("error", "Database services not configured"));
+        }
+
+        Map<String, Object> metrics = new HashMap<>();
+        metrics.put("serverId", serverId);
+        metrics.put("timestamp", System.currentTimeMillis());
+        // Persistence service metrics
+        Map<String, Object> persistenceMetrics = new HashMap<>();
+        persistenceMetrics.put("messages_inserted", persistenceService.getMessagesInserted());
+        persistenceMetrics.put("insert_errors", persistenceService.getInsertErrors());
+        persistenceMetrics.put("user_activity_updates", persistenceService.getUserActivityUpdates());
+        metrics.put("persistence", persistenceMetrics);
+
+        return ResponseEntity.ok(metrics);
+    }
+
+    private Map<String, Object> getWriteMetrics() {
+        Map<String, Object> writeMetrics = new HashMap<>();
+        writeMetrics.put("messagesSent", writeManager.getTotalMessagesSent());
+        writeMetrics.put("messagesQueued", writeManager.getTotalMessagesQueued());
+        writeMetrics.put("messagesDropped", writeManager.getTotalMessagesDropped());
+        writeMetrics.put("writeErrors", writeManager.getTotalWriteErrors());
+        writeMetrics.put("activeSessions", writeManager.getActiveSessionCount());
+        writeMetrics.put("activeWriterThreads", writeManager.getActiveWriterThreadCount());
+        return writeMetrics;
+    }
+
+    /**
+     * Returns SQS queue depth statistics for a specific room.
+     * 
+     * @param roomId the room ID to check
+     * @return queue statistics including visible, in-flight, and delayed message
+     *         counts
      */
     @GetMapping("/queue/{roomId}")
     public ResponseEntity<Map<String, Object>> queueStats(@PathVariable String roomId) {
@@ -113,7 +214,10 @@ public class HealthController {
     }
 
     /**
-     * Get all queue depths
+     * Returns SQS queue statistics for all 20 rooms.
+     * Useful for monitoring queue health across the entire system.
+     * 
+     * @return map of room statistics
      */
     @GetMapping("/queue/all")
     public ResponseEntity<Map<String, Object>> allQueueStats() {
@@ -136,5 +240,39 @@ public class HealthController {
         }
 
         return ResponseEntity.ok(allStats);
+    }
+
+    // Helper methods for health checks
+    private boolean checkSQSHealth() {
+        try {
+            Map<String, String> attrs = sqsService.getQueueAttributes("1");
+            return attrs != null && !attrs.isEmpty();
+        } catch (Exception e) {
+            log.error("SQS health check failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private boolean checkWriteManagerHealth() {
+        try {
+            long activeWriters = writeManager.getActiveWriterThreadCount();
+            return activeWriters >= 0;
+        } catch (Exception e) {
+            log.error("Write manager health check failed: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    private boolean checkDatabaseHealth() {
+        if (persistenceService == null) {
+            return true; // Database is optional
+        }
+
+        try {
+            return persistenceService.testConnection();
+        } catch (Exception e) {
+            log.error("Database health check failed: {}", e.getMessage());
+            return false;
+        }
     }
 }

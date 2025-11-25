@@ -30,4 +30,12 @@ public class ChatMessage {
     public enum MessageType {
         TEXT, JOIN, LEAVE
     }
+
+    public boolean isQueuedMessage() {
+        return messageType == MessageType.TEXT;
+    }
+    
+    public boolean isSynchronousMessage() {
+        return messageType == MessageType.JOIN || messageType == MessageType.LEAVE;
+    }
 }

@@ -143,7 +143,7 @@
 
 ```bash
 # In AWS Console, get the ALB DNS name
-# Format: chatflow-alb-XXXXXXXXX.us-east-1.elb.amazonaws.com
+# Format: chatflow-alb-XXXXXXXXX.us-west-2.elb.amazonaws.com
 ```
 
 ### Step 2: Test Health Endpoint

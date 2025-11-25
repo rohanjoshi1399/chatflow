@@ -3,7 +3,9 @@ package com.chatflow.server.handler;
 import com.chatflow.server.model.ChatMessage;
 import com.chatflow.server.model.QueueMessage;
 import com.chatflow.server.service.SQSService;
-import com.chatflow.server.service.RoomSessionManager;
+import com.chatflow.server.service.SQSBatchPublisher;
+import com.chatflow.server.service.RoomManager;
+import com.chatflow.server.service.WebSocketWriteManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -30,8 +32,14 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     @Autowired
     private SQSService sqsService;
 
+    @Autowired(required = false)
+    private SQSBatchPublisher batchPublisher;
+
     @Autowired
-    private RoomSessionManager roomManager;
+    private RoomManager roomManager;
+
+    @Autowired
+    private WebSocketWriteManager writeManager;
 
     @Value("${server.id:server-1}")
     private String serverId;
@@ -39,19 +47,26 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
     private final AtomicLong messagesReceived = new AtomicLong(0);
     private final AtomicLong messagesPublished = new AtomicLong(0);
     private final AtomicLong messagesFailed = new AtomicLong(0);
+    private final AtomicLong acksSent = new AtomicLong(0);
+    private final AtomicLong acksFailed = new AtomicLong(0);
 
     @Override
     public void afterConnectionEstablished(WebSocketSession session) throws Exception {
         String roomId = extractRoomId(session);
+
+        if (roomId == null) {
+            log.warn("Invalid room ID in connection path: {}", session.getUri());
+            session.close(CloseStatus.BAD_DATA);
+            return;
+        }
+
         log.info("WebSocket connection established: sessionId={}, roomId={}, remoteAddress={}",
                 session.getId(), roomId, session.getRemoteAddress());
 
-        // Register session with RoomManager
-        if (roomId != null) {
-            roomManager.addSessionToRoom(roomId, session);
-            // Store roomId in session attributes for later use
-            session.getAttributes().put("roomId", roomId);
-        }
+        session.getAttributes().put("roomId", roomId);
+
+        writeManager.registerSession(session);
+        roomManager.addSessionToRoom(roomId, session);
     }
 
     @Override
@@ -62,7 +77,6 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
             String payload = message.getPayload();
             ChatMessage chatMessage = objectMapper.readValue(payload, ChatMessage.class);
 
-            // Get roomId from session (extracted from WebSocket path)
             String roomId = (String) session.getAttributes().get("roomId");
 
             if (roomId == null) {
@@ -72,7 +86,6 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
                 return;
             }
 
-            // Validate message
             if (!isValidMessage(chatMessage)) {
                 log.warn("Invalid message received from session {}: {}", session.getId(), payload);
                 sendErrorResponse(session, "Invalid message format");
@@ -80,10 +93,9 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
                 return;
             }
 
-            // Extract client IP
+            session.getAttributes().put("userId", chatMessage.getUserId());
             String clientIp = getClientIp(session);
 
-            // Create queue message
             QueueMessage queueMessage = new QueueMessage(
                     roomId,
                     chatMessage.getUserId(),
@@ -94,20 +106,21 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
                     clientIp
             );
 
-            // Store userId in session for broadcast filtering
-            session.getAttributes().put("userId", chatMessage.getUserId());
-            sendAckResponse(session, chatMessage);
-
-            // Publish to SQS
-            boolean published = sqsService.publishMessage(queueMessage);
+            boolean published;
+            if (batchPublisher != null && batchPublisher.isEnabled()) {
+                published = batchPublisher.publishMessage(queueMessage);
+            } else {
+                published = sqsService.publishMessage(queueMessage);
+            }
 
             if (published) {
                 messagesPublished.incrementAndGet();
+                sendAckResponse(session, chatMessage);
                 log.debug("Message published to queue: roomId={}, messageId={}",
-                        queueMessage.getRoomId(), queueMessage.getMessageId());
+                        roomId, queueMessage.getMessageId());
             } else {
                 messagesFailed.incrementAndGet();
-                log.error("Failed to publish message to queue: roomId={}", queueMessage.getRoomId());
+                log.error("Failed to publish message to queue: roomId={}", roomId);
                 sendErrorResponse(session, "Failed to queue message");
             }
 
@@ -124,30 +137,25 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         log.info("WebSocket connection closed: sessionId={}, roomId={}, status={}",
                 session.getId(), roomId, status);
 
-        // Unregister session from RoomManager
         roomManager.unregisterSession(session);
+        writeManager.unregisterSession(session.getId());
     }
 
     @Override
     public void handleTransportError(WebSocketSession session, Throwable exception) throws Exception {
         log.error("WebSocket transport error for session {}: {}", session.getId(), exception.getMessage());
         roomManager.unregisterSession(session);
+        writeManager.unregisterSession(session.getId());
     }
 
-    /**
-     * Extract room ID from WebSocket path
-     * Expected path format: /chat/{roomId}
-     */
     private String extractRoomId(WebSocketSession session) {
         try {
             URI uri = session.getUri();
             if (uri != null) {
                 String path = uri.getPath();
-                // Path format: /chat/1, /chat/2, etc.
                 String[] parts = path.split("/");
                 if (parts.length >= 3) {
                     String roomId = parts[2];
-                    // Validate roomId is 1-20
                     int room = Integer.parseInt(roomId);
                     if (room >= 1 && room <= 20) {
                         return roomId;
@@ -160,70 +168,84 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         return null;
     }
 
-    /**
-     * Validate incoming message
-     */
     private boolean isValidMessage(ChatMessage message) {
         if (message == null) {
             return false;
         }
 
-        // Check userId (1-100000)
         if (message.getUserId() == null || message.getUserId().trim().isEmpty()) {
             return false;
         }
 
-        // Check username (3-20 chars)
         if (message.getUsername() == null ||
                 message.getUsername().length() < 3 ||
                 message.getUsername().length() > 20) {
             return false;
         }
 
-        // Check message (1-500 chars)
         if (message.getMessage() == null ||
-                message.getMessage().isEmpty() ||
+                message.getMessage().length() < 1 ||
                 message.getMessage().length() > 500) {
             return false;
         }
 
-        // Check timestamp (should be present)
         if (message.getTimestamp() == null || message.getTimestamp().trim().isEmpty()) {
             return false;
         }
 
-        // Check messageType (TEXT, JOIN, or LEAVE)
-        if (message.getMessageType() != null) {
-            String type = message.getMessageType().toString().toUpperCase();
-            return type.equals("TEXT") || type.equals("JOIN") || type.equals("LEAVE");
-        } else {
+        if (message.getMessageType() == null) {
             return false;
         }
 
+        String type = message.getMessageType().toString().toUpperCase();
+        if (!type.equals("TEXT") && !type.equals("JOIN") && !type.equals("LEAVE")) {
+            return false;
+        }
+
+        return true;
     }
 
-    /**
-     * Send error response to client
-     */
+    private void sendAckResponse(WebSocketSession session, ChatMessage chatMessage) {
+        try {
+            Map<String, Object> ack = new HashMap<>();
+            ack.put("status", "SUCCESS");
+            ack.put("messageId", java.util.UUID.randomUUID().toString());
+            ack.put("timestamp", java.time.Instant.now().toString());
+            ack.put("originalMessage", chatMessage);
+
+            String jsonResponse = objectMapper.writeValueAsString(ack);
+            boolean sent = writeManager.sendMessage(session, jsonResponse);
+
+            if (sent) {
+                acksSent.incrementAndGet();
+            } else {
+                acksFailed.incrementAndGet();
+                log.warn("Failed to queue ACK for session {}", session.getId());
+            }
+
+        } catch (Exception e) {
+            log.error("Failed to send ACK to session {}: {}", session.getId(), e.getMessage());
+            acksFailed.incrementAndGet();
+        }
+    }
+
     private void sendErrorResponse(WebSocketSession session, String errorMessage) {
         try {
             ChatMessage errorResponse = new ChatMessage();
-            errorResponse.setMessageType(ChatMessage.MessageType.TEXT);
+            errorResponse.setMessageType(ChatMessage.MessageType.valueOf("ERROR"));
             errorResponse.setMessage(errorMessage);
             errorResponse.setUserId("system");
             errorResponse.setUsername("system");
             errorResponse.setTimestamp(java.time.Instant.now().toString());
 
             String jsonResponse = objectMapper.writeValueAsString(errorResponse);
-            session.sendMessage(new TextMessage(jsonResponse));
+            writeManager.sendMessage(session, jsonResponse);
+
         } catch (Exception e) {
             log.error("Failed to send error response to session {}: {}", session.getId(), e.getMessage());
         }
     }
 
-    /**
-     * Extract client IP from session
-     */
     private String getClientIp(WebSocketSession session) {
         try {
             InetSocketAddress remoteAddress = session.getRemoteAddress();
@@ -236,22 +258,6 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
         return "unknown";
     }
 
-    private void sendAckResponse(WebSocketSession session, ChatMessage chatMessage) {
-        try {
-            Map<String, Object> ack = new HashMap<>();
-            ack.put("status", "SUCCESS");
-            ack.put("originalMessage", chatMessage);
-
-            String jsonResponse = objectMapper.writeValueAsString(ack);
-            session.sendMessage(new TextMessage(jsonResponse));
-        } catch (Exception e) {
-            log.error("Failed to send ACK: {}", e.getMessage());
-        }
-    }
-
-    /**
-     * Get metrics for monitoring
-     */
     public long getMessagesReceived() {
         return messagesReceived.get();
     }
@@ -262,5 +268,13 @@ public class ChatWebSocketHandler extends TextWebSocketHandler {
 
     public long getMessagesFailed() {
         return messagesFailed.get();
+    }
+
+    public long getAcksSent() {
+        return acksSent.get();
+    }
+
+    public long getAcksFailed() {
+        return acksFailed.get();
     }
 }

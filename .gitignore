@@ -1,5 +1,34 @@
+# IDE files
 .idea/
+.vscode/
 *.iml
-out/
-*target/
+*.swp
+*.swo
+*~
+
+# Build artifacts
+target/
 build/
+out/
+*.class
+*.jar
+!**/wrapper/*.jar
+
+# Test outputs and logs
+*.log
+*.txt
+!README.txt
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment files
+.env
+.env.local
+
+# Temporary files
+*.tmp
+*.bak
+*.cache

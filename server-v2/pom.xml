@@ -76,6 +76,19 @@
             <artifactId>auth</artifactId>
             <version>2.21.0</version>
         </dependency>
+        
+        <!-- Assignment 3: PostgreSQL for Aurora -->
+        <dependency>
+            <groupId>org.postgresql</groupId>
+            <artifactId>postgresql</artifactId>
+            <version>42.7.1</version>
+        </dependency>
+        
+        <!-- Assignment 3: Spring JDBC for database operations -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-jdbc</artifactId>
+        </dependency>
     </dependencies>
 
     <build>
