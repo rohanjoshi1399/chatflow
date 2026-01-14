@@ -32,3 +32,4 @@ desktop.ini
 *.tmp
 *.bak
 *.cache
+client/*.class
