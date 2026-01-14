@@ -16,31 +16,16 @@ The system evolved through multiple iterations to achieve high scalability and p
 
 ```mermaid
 graph TB
-    Client[Clients] --> ALB[Application Load Balancer]
-    ALB --> Server1[Server 1<br/>EC2 Instance]
-    ALB --> Server2[Server 2<br/>EC2 Instance]
-    ALB --> Server3[Server 3<br/>EC2 Instance]
-    ALB --> Server4[Server 4<br/>EC2 Instance]
+    Client[Clients] --> ALB[Load Balancer]
     
-    Server1 -- Publish --> SQS[SQS FIFO Queues<br/>20 Rooms]
-    Server2 -- Publish --> SQS
-    Server3 -- Publish --> SQS
-    Server4 -- Publish --> SQS
+    ALB --> Servers[4x Server Nodes<br/>EC2 Instances]
     
-    SQS -- Consumer Threads --> Server1
-    SQS -- Consumer Threads --> Server2
-    SQS -- Consumer Threads --> Server3
-    SQS -- Consumer Threads --> Server4
+    Servers -->|Publish| SQS[SQS FIFO Queues<br/>20 Rooms]
+    SQS -->|Consume| Servers
     
-    Server1 -- Batch Writer --> DB[(Aurora PostgreSQL<br/>messages<br/>user_activity)]
-    Server2 -- Batch Writer --> DB
-    Server3 -- Batch Writer --> DB
-    Server4 -- Batch Writer --> DB
+    Servers -->|Batch Write<br/>1000 msgs| DB[(Aurora PostgreSQL<br/>messages & user_activity)]
     
-    Server1 -- Broadcast --> Client
-    Server2 -- Broadcast --> Client
-    Server3 -- Broadcast --> Client
-    Server4 -- Broadcast --> Client
+    Servers -->|Broadcast| Client
 ```
 
 **Message Flow:**
