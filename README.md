@@ -4,25 +4,53 @@
 
 ## 🏗️ Architecture Overview
 
-The system has evolved from a simple client-server model (v1) to a robust distributed architecture (v2).
+The system evolved through multiple iterations to achieve high scalability and performance:
 
 **Key Components:**
 *   **Load Balancer (AWS ALB)**: Distributes WebSocket connections across multiple server instances using sticky sessions.
-*   **Server Nodes (EC2)**: Stateless Java servers that handle WebSocket connections and publish messages to queues.
-*   **Message Broker (AWS SQS)**: FIFO queues ensure ordered delivery of messages within chat rooms.
-*   **Database (Aurora PostgreSQL)**: Optimized schema for storing chat history and analytics.
+*   **Server Nodes (4x EC2)**: Stateless Java servers that handle WebSocket connections and publish messages to SQS queues.
+*   **Message Broker (AWS SQS)**: 20 FIFO queues (one per chat room) ensure ordered delivery of messages.
+*   **Consumer Service**: Multi-threaded consumers on each server poll SQS queues and batch messages for persistence.
+*   **Batch Writer**: Optimized batch insertion service that writes messages to the database in batches of 1,000.
+*   **Database (Aurora PostgreSQL)**: Stores chat history in `messages` and `user_activity` tables with materialized views for analytics.
 
 ```mermaid
-graph LR
-    Client --> ALB[Load Balancer]
-    ALB --> Server1
-    ALB --> Server2
-    Server1 -- Publish --> SQS[SQS FIFO Queues]
+graph TB
+    Client[Clients] --> ALB[Application Load Balancer]
+    ALB --> Server1[Server 1<br/>EC2 Instance]
+    ALB --> Server2[Server 2<br/>EC2 Instance]
+    ALB --> Server3[Server 3<br/>EC2 Instance]
+    ALB --> Server4[Server 4<br/>EC2 Instance]
+    
+    Server1 -- Publish --> SQS[SQS FIFO Queues<br/>20 Rooms]
     Server2 -- Publish --> SQS
-    SQS -- Consume --> Server1
-    SQS -- Consume --> Server2
+    Server3 -- Publish --> SQS
+    Server4 -- Publish --> SQS
+    
+    SQS -- Consumer Threads --> Server1
+    SQS -- Consumer Threads --> Server2
+    SQS -- Consumer Threads --> Server3
+    SQS -- Consumer Threads --> Server4
+    
+    Server1 -- Batch Writer --> DB[(Aurora PostgreSQL<br/>messages<br/>user_activity)]
+    Server2 -- Batch Writer --> DB
+    Server3 -- Batch Writer --> DB
+    Server4 -- Batch Writer --> DB
+    
     Server1 -- Broadcast --> Client
+    Server2 -- Broadcast --> Client
+    Server3 -- Broadcast --> Client
+    Server4 -- Broadcast --> Client
 ```
+
+**Message Flow:**
+1. Client sends message via WebSocket to ALB
+2. ALB routes to one server instance (sticky session)
+3. Server validates and publishes to the appropriate SQS FIFO queue (based on room ID)
+4. Consumer threads on ALL servers poll queues
+5. Consumers add messages to batch writer buffer
+6. Batch writer flushes 1,000 messages at a time to Aurora PostgreSQL
+7. Consumers broadcast message to all connected clients in that room
 
 ## 📂 Project Structure
 
